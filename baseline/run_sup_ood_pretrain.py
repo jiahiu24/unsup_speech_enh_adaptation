@@ -1,265 +1,223 @@
 """!
-@brief Running an experiment with a supervised Sudo rm -rf teacher
-for one- and multi-speaker speech enhancement settings
+@brief Training script for supervised SudoRM-RF on EMG denoising task.
 
-@author Efthymios Tzinis {etzinis2@illinois.edu}
+@author Your Name
 @copyright University of Illinois at Urbana-Champaign
 """
 
 import os
-
-from __config__ import API_KEY
-from comet_ml import Experiment
-
+import sys
 import torch
 import numpy as np
-
 from tqdm import tqdm
 from pprint import pprint
-import baseline.utils.cmd_parser as parser
-import baseline.utils.cometml_logger as cometml_logger
-import baseline.utils.dataset_setup as dataset_setup
-import baseline.utils.mixture_consistency as mixture_consistency
-import baseline.models.improved_sudormrf as improved_sudormrf
-import baseline.metrics.dnnmos_metric as dnnmos_metric
-from asteroid.losses import pairwise_neg_sisdr
-from multiprocessing import Pool
 
+# Ensure local imports work
+sys.path.append(os.getcwd())
 
-def compute_dnsmos_process(est_speech):
-    return dnnmos_metric.compute_dnsmos(est_speech, fs=16000)
-
-
-args = parser.get_args()
-hparams = vars(args)
-generators = dataset_setup.supervised_setup(hparams)
-
-audio_logger = cometml_logger.AudioLogger(fs=hparams["fs"], n_sources=2)
-
-experiment = Experiment(API_KEY, project_name=hparams["project_name"])
-experiment.log_parameters(hparams)
-experiment_name = '_'.join(hparams['cometml_tags'])
-
-for tag in hparams['cometml_tags']:
-    experiment.add_tag(tag)
-if hparams['experiment_name'] is not None:
-    experiment.set_name(hparams['experiment_name'])
-else:
-    experiment.set_name(experiment_name)
-
-checkpoint_storage_path = os.path.join(hparams["checkpoint_storage_path"],
-                                       experiment_name)
-if checkpoint_storage_path is not None:
-    if hparams["save_models_every"] <= 0:
-        raise ValueError("Expected a value greater than 0 for checkpoint storing.")
-    if not os.path.exists(checkpoint_storage_path):
-        os.makedirs(checkpoint_storage_path)
-        print(f"Created directory: {checkpoint_storage_path}")
-
-
-os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(
-    [cad for cad in hparams['cuda_available_devices']])
-
-train_loss_name, train_loss = "train_neg_sisdr", pairwise_neg_sisdr
-
-val_losses = {
-    "train_speaker": {"sisdr": pairwise_neg_sisdr},
-    "train_noise": {"sisdr": pairwise_neg_sisdr},
-    "train_total": {"sisdr": pairwise_neg_sisdr},
-}
-for val_set in [x for x in generators if not x == 'train']:
-    if generators[val_set] is None:
-        continue
-    if val_set in ['val_chime_1sp', 'test_chime_1sp']:
-        val_losses[val_set] = {
-            "sig_mos": None,
-            "bak_mos": None,
-            "ovr_mos": None,
-        }
-    else:
-        val_losses[val_set] = {
-            "sisdr": pairwise_neg_sisdr, "sisdri": pairwise_neg_sisdr
-        }
-
-model = improved_sudormrf.SuDORMRF(out_channels=hparams['out_channels'],
-                                   in_channels=hparams['in_channels'],
-                                   num_blocks=hparams['num_blocks'],
-                                   upsampling_depth=hparams['upsampling_depth'],
-                                   enc_kernel_size=hparams['enc_kernel_size'],
-                                   enc_num_basis=hparams['enc_num_basis'],
-                                   num_sources=hparams['max_num_sources'])
-
-numparams = 0
-for f in model.parameters():
-    if f.requires_grad:
-        numparams += f.numel()
-experiment.log_parameter('Parameters', numparams)
-print('Trainable Parameters: {}'.format(numparams))
-
-model = torch.nn.DataParallel(model).cuda()
-opt = torch.optim.Adam(model.parameters(), lr=hparams['learning_rate'])
+from utils.config_loader import load_config
+from utils.cometml_logger import report_losses_mean_and_std
+from utils.mixture_consistency import apply as apply_mixture_consistency
+from models.improved_sudormrf import SuDORMRF
+from utils.emg_logger import EMGLogger  
+from utils.emg_dataset import get_emg_dataloaders
+from losses.loss import negative_si_snr
+import comet_ml
 
 
 def apply_output_transform(rec_sources_wavs, input_mix_std,
-                           input_mix_mean, input_mom, hparams):
+                           input_mix_mean, input_mix, hparams):
     if hparams["rescale_to_input_mixture"]:
         rec_sources_wavs = (rec_sources_wavs * input_mix_std) + input_mix_mean
     if hparams["apply_mixture_consistency"]:
-        rec_sources_wavs = mixture_consistency.apply(rec_sources_wavs, input_mom)
+        rec_sources_wavs = apply_mixture_consistency(rec_sources_wavs, input_mix)
     return rec_sources_wavs
 
-tr_step = 0
-val_step = 0
-sum_loss = 0.
-for i in range(hparams['n_epochs']):
-    res_dic = {}
-    for d_name in val_losses:
-        res_dic[d_name] = {}
-        for loss_name in val_losses[d_name]:
-            res_dic[d_name][loss_name] = {'mean': 0., 'std': 0., 'acc': []}
-    print("Supervised teacher Sudo-RM RF: {} - {} || Epoch: {}/{}".format(
-        experiment.get_key(), experiment.get_tags(), i + 1,
-        hparams['n_epochs']))
-    model.train()
-    train_tqdm_gen = tqdm(generators['train'], desc='Training')
 
-    sum_loss = 0.0
-    for cnt, (speakers, noise) in enumerate(train_tqdm_gen):
-        opt.zero_grad()
-        gt_speaker_mix = speakers.sum(1, keepdims=True).cuda()
-        noise = noise.cuda()
+def main():
+    config_path = "config/emg_config.yaml"
+    hparams = load_config(config_path)
 
-        input_mix = noise + gt_speaker_mix
-        input_mix_std = input_mix.std(-1, keepdim=True)
-        input_mix_mean = input_mix.mean(-1, keepdim=True)
-        input_mix = (input_mix - input_mix_mean) / (input_mix_std + 1e-9)
+    # Setup Comet.ml experiment (assuming already initialized globally as `experiment`)
+    from comet_ml import Experiment
+    global experiment
+    experiment = Experiment(api_key=hparams["API_KEY"], project_name=hparams["project_name"])
+    experiment.log_parameters(hparams)
 
-        rec_sources_wavs = model(input_mix)
-        rec_sources_wavs = apply_output_transform(
-            rec_sources_wavs, input_mix_std, input_mix_mean, input_mix, hparams)
-        teacher_est_active_speakers = rec_sources_wavs[:, 0:1]
-        teacher_est_noises = rec_sources_wavs[:, 1:]
+    # Setup data
+    train_loader, val_loader = get_emg_dataloaders(
+        train_dir=hparams["train_dir"],
+        val_dir=hparams["val_dir"],
+        batch_size=hparams["batch_size"],
+        num_workers=hparams.get("num_workers", 4)
+    )
 
-        speaker_l = torch.mean(
-            torch.clamp(train_loss(teacher_est_active_speakers, gt_speaker_mix),
-                                min=-30., max=+30.))
+    # Initialize model
+    model = SuDORMRF(
+        out_channels=hparams['out_channels'],
+        in_channels=hparams['in_channels'],
+        num_blocks=hparams['num_blocks'],
+        upsampling_depth=hparams['upsampling_depth'],
+        enc_kernel_size=hparams['enc_kernel_size'],
+        enc_num_basis=hparams['enc_num_basis'],
+        num_sources=hparams['max_num_sources']  # should be 2: [clean, noise]
+    )
 
-        noise_l = torch.mean(torch.clamp(train_loss(teacher_est_noises, noise),
-                              min=-30., max=+30.))
+    numparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    experiment.log_parameter('Parameters', numparams)
+    print(f'Trainable Parameters: {numparams}')
 
-        l = 0.5 * speaker_l + 0.5 * noise_l
-        l.backward()
-        if hparams['clip_grad_norm'] > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), hparams['clip_grad_norm'])
+    model = torch.nn.DataParallel(model).cuda()
+    opt = torch.optim.Adam(model.parameters(), lr=hparams['learning_rate'])
 
-        opt.step()
+    # Initialize EMG logger
+    emg_logger = EMGLogger(fs=hparams.get("fs", 1000.0), n_sources=2)
 
-        np_loss_value = l.detach().item()
-        sum_loss += np_loss_value
-        train_tqdm_gen.set_description(
-            f"Training, Running Avg Loss: {round(sum_loss / (cnt + 1), 2)}")
-        res_dic['train_total']['sisdr']['acc'] += [- l.detach().cpu()]
-        res_dic['train_speaker']['sisdr']['acc'] += [- speaker_l.detach().cpu()]
-        res_dic['train_noise']['sisdr']['acc'] += [- noise_l.detach().cpu()]
-
-    if hparams['patience'] > 0:
-        if tr_step % hparams['patience'] == 0:
-            new_lr = (hparams['learning_rate'] / (hparams['divide_lr_by'] ** (
-                    tr_step // hparams['patience'])))
-            print('Reducing Learning rate to: {}'.format(new_lr))
-            for param_group in opt.param_groups:
-                param_group['lr'] = new_lr
-    tr_step += 1
-
-    for val_d_name in [x for x in generators if not x == 'train']:
-        if generators[val_d_name] is None:
-            continue
-        if hparams["save_models_every"] > 0 and not tr_step % hparams["save_models_every"] == 0:
-            continue
-        if val_d_name in ['val_chime_1sp', 'test_chime_1sp']:
-            model.eval()
-            with torch.no_grad():
-                for mixture in tqdm(generators[val_d_name],
-                                    desc='Validation on {}'.format(val_d_name)):
-                    input_mix = mixture.unsqueeze(1).cuda()
-
-                    input_mix_std = input_mix.std(-1, keepdim=True)
-                    input_mix_mean = input_mix.mean(-1, keepdim=True)
-                    input_mix = (input_mix - input_mix_mean) / (input_mix_std + 1e-9)
-
-                    student_estimates = model(input_mix)
-                    student_estimates = apply_output_transform(
-                        student_estimates, input_mix_std, input_mix_mean,
-                        input_mix, hparams)
-
-                    s_est_speech = student_estimates[:, 0].detach().cpu().numpy()
-                    s_est_speech -= s_est_speech.mean(-1, keepdims=True)
-                    s_est_speech /= np.abs(s_est_speech).max(-1, keepdims=True) + 1e-9
-
-                    # Parallelize the DNS-MOS computation.
-                    num_of_workers = max(os.cpu_count() // (hparams["n_jobs"] * 2), 1)
-                    with Pool(num_of_workers) as p:
-                        args_list = [s_est_speech[b_ind]
-                                     for b_ind in range(s_est_speech.shape[0])]
-                        for dnsmos_values in p.map(compute_dnsmos_process, args_list):
-                            for k1, v1 in dnsmos_values.items():
-                                res_dic[val_d_name][k1]['acc'].append(v1)
-        else:
-            model.eval()
-            with torch.no_grad():
-                for speakers, noise in tqdm(generators[val_d_name],
-                                           desc='Validation on {}'.format(val_d_name)):
-                    gt_speaker_mix = speakers.sum(1, keepdims=True).cuda()
-                    noise = noise.cuda()
-
-                    input_mix = noise + gt_speaker_mix
-                    input_mix_std = input_mix.std(-1, keepdim=True)
-                    input_mix_mean = input_mix.mean(-1, keepdim=True)
-                    input_mix = (input_mix - input_mix_mean) / (input_mix_std + 1e-9)
-
-                    rec_sources_wavs = model(input_mix)
-                    rec_sources_wavs = apply_output_transform(
-                        rec_sources_wavs, input_mix_std, input_mix_mean, input_mix, hparams)
-                    teacher_est_active_speakers = rec_sources_wavs[:, 0:1]
-                    teacher_est_noises = rec_sources_wavs[:, 1:]
-
-                    sisdr = - pairwise_neg_sisdr(
-                        teacher_est_active_speakers, gt_speaker_mix).detach().cpu()
-                    mix_sisdr = sisdr + pairwise_neg_sisdr(
-                        input_mix, gt_speaker_mix).detach().cpu()
-                    res_dic[val_d_name]['sisdr']['acc'] += sisdr.tolist()
-                    res_dic[val_d_name]['sisdri']['acc'] += mix_sisdr.tolist()
-
-            if hparams["log_audio"]:
-                audio_logger.log_sp_enh_batch(
-                    teacher_est_active_speakers.detach(),
-                    teacher_est_noises.detach(),
-                    gt_speaker_mix.detach(),
-                    noise.detach(),
-                    input_mix.detach(),
-                    experiment, step=val_step, tag=val_d_name, max_batch_items=4)
-
-    val_step += 1
-
-    if hparams["save_models_every"] > 0 and not tr_step % hparams["save_models_every"] == 0:
-        for d_name in res_dic:
-            for loss_name in res_dic[d_name]:
-                res_dic[d_name][loss_name]['acc'] = []
-    else:
-        res_dic = cometml_logger.report_losses_mean_and_std(
-            res_dic, experiment, tr_step, val_step)
-
-        for d_name in res_dic:
-            for loss_name in res_dic[d_name]:
-                res_dic[d_name][loss_name]['acc'] = []
-        pprint(res_dic)
-
+    # Paths
+    checkpoint_storage_path = os.path.join(hparams["checkpoint_storage_path"], hparams["project_name"])
     if hparams["save_models_every"] > 0:
-        if tr_step % hparams["save_models_every"] == 0:
-            torch.save(
-                model.module.cpu().state_dict(),
-                os.path.join(checkpoint_storage_path,
-                             f"sup_teacher_epoch_{tr_step}.pt"),
+        os.makedirs(checkpoint_storage_path, exist_ok=True)
+
+    # Training loop
+    tr_step = 0
+    val_step = 0
+
+    for epoch in range(hparams['n_epochs']):
+        print(f"Epoch {epoch + 1}/{hparams['n_epochs']}")
+
+        # ------------------------
+        # Training
+        # ------------------------
+        model.train()
+        sum_loss = 0.0
+        train_tqdm_gen = tqdm(train_loader, desc="Training")
+        speaker_losses, noise_losses = [], []  
+
+        for cnt, batch in enumerate(train_tqdm_gen):
+            opt.zero_grad()
+
+            clean = batch["clean"].cuda()   # (B, L)
+            noise = batch["noise"].cuda()   # (B, L)
+
+            gt_clean = clean.unsqueeze(1)   # (B, 1, L)
+            mixture = (clean + noise).unsqueeze(1)  # (B, 1, L)
+
+            # Normalize mixture
+            mix_std = mixture.std(dim=-1, keepdim=True)
+            mix_mean = mixture.mean(dim=-1, keepdim=True)
+            norm_mixture = (mixture - mix_mean) / (mix_std + 1e-9)
+
+            # Forward
+            estimates = model(norm_mixture)  # (B, 2, L)
+            estimates = apply_output_transform(estimates, mix_std, mix_mean, mixture, hparams)
+
+            est_clean = estimates[:, 0:1]   # (B, 1, L)
+            est_noise = estimates[:, 1:2]   # (B, 1, L)
+
+            # Loss
+            clean_loss = torch.clamp(negative_si_snr(est_clean, gt_clean), min=-30., max=30.).mean()
+            noise_loss = torch.clamp(negative_si_snr(est_noise, noise.unsqueeze(1)), min=-30., max=30.).mean()
+            total_loss = 0.5 * clean_loss + 0.5 * noise_loss
+
+            total_loss.backward()
+            if hparams['clip_grad_norm'] > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), hparams['clip_grad_norm'])
+            opt.step()
+
+            # Logging
+            sum_loss += total_loss.item()
+            speaker_losses.append(clean_loss.item())
+            noise_losses.append(noise_loss.item())
+            train_tqdm_gen.set_description(f"Train Loss: {sum_loss / (cnt + 1):.3f}")
+
+        tr_step += 1
+
+        # Learning rate scheduling
+        if hparams['patience'] > 0 and tr_step % hparams['patience'] == 0:
+            new_lr = hparams['learning_rate'] / (hparams['divide_lr_by'] ** (tr_step // hparams['patience']))
+            print(f"Reducing LR to {new_lr}")
+            for pg in opt.param_groups:
+                pg['lr'] = new_lr
+
+        # ------------------------
+        # Validation
+        # ------------------------
+        model.eval()
+        val_sisdr, val_sisdri = [], []
+        with torch.no_grad():
+            val_tqdm = tqdm(val_loader, desc="Validation")
+            for batch in val_tqdm:
+                clean = batch["clean"].cuda()
+                noise = batch["noise"].cuda()
+
+                gt_clean = clean.unsqueeze(1)
+                mixture = (clean + noise).unsqueeze(1)
+
+                mix_std = mixture.std(dim=-1, keepdim=True)
+                mix_mean = mixture.mean(dim=-1, keepdim=True)
+                norm_mixture = (mixture - mix_mean) / (mix_std + 1e-9)
+
+                estimates = model(norm_mixture)
+                estimates = apply_output_transform(estimates, mix_std, mix_mean, mixture, hparams)
+
+                est_clean = estimates[:, 0:1]
+
+                sisdr_vals = -negative_si_snr(est_clean, gt_clean).cpu()
+                mix_sisdr = -negative_si_snr(mixture, gt_clean).cpu()
+                sisdri_vals = sisdr_vals - mix_sisdr
+
+                val_sisdr.extend(sisdr_vals.tolist())
+                val_sisdri.extend(sisdri_vals.tolist())
+
+        # Log validation metrics
+        res_dic = {
+            "val_emg": {
+                "sisdr": {"acc": val_sisdr},
+                "sisdri": {"acc": val_sisdri}
+            }
+        }
+
+        # Log EMG waveforms (only if enabled)
+        if hparams.get("log_signals", False) and val_loader.dataset:
+            # Take first batch for logging
+            batch = next(iter(val_loader))
+            clean = batch["clean"].cuda()
+            noise = batch["noise"].cuda()
+            gt_clean = clean.unsqueeze(1)
+            mixture = (clean + noise).unsqueeze(1)
+
+            mix_std = mixture.std(dim=-1, keepdim=True)
+            mix_mean = mixture.mean(dim=-1, keepdim=True)
+            norm_mixture = (mixture - mix_mean) / (mix_std + 1e-9)
+
+            estimates = model(norm_mixture)
+            estimates = apply_output_transform(estimates, mix_std, mix_mean, mixture, hparams)
+
+            emg_logger.log_emg_batch(
+                experiment=experiment,
+                est_clean=estimates[:, 0:1].detach(),
+                est_noise=estimates[:, 1:2].detach(),
+                gt_clean=gt_clean.detach(),
+                gt_noise=noise.unsqueeze(1).detach(),
+                mixture=mixture.detach(),
+                step=tr_step,
+                tag="val_emg",
+                max_batch_items=4,
             )
-            # Restore the model in the proper device.
-            model = model.cuda()
+
+        # Report metrics to Comet
+        res_dic = report_losses_mean_and_std(res_dic, experiment, val_step)
+        pprint(res_dic)
+        val_step += 1
+
+        # Save checkpoint
+        if hparams["save_models_every"] > 0 and tr_step % hparams["save_models_every"] == 0:
+            ckpt_path = os.path.join(checkpoint_storage_path, f"sup_teacher_epoch_{tr_step}.pt")
+            torch.save(model.module.cpu().state_dict(), ckpt_path)
+            model = model.cuda()  # move back to GPU
+
+    experiment.end()
+
+
+if __name__ == "__main__":
+    main()

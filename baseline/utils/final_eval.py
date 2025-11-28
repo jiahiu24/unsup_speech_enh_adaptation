@@ -1,162 +1,222 @@
 """!
-@brief Final evaluation of a pre-trained checkpoint model.
+@brief Final evaluation of a pre-trained SuDORM-RF model on EMG denoising task.
+        Configuration is loaded from a YAML file (e.g., eval.yaml).
 
-@author Efthymios Tzinis {etzinis2@illinois.edu}
+@author Your Name
 @copyright University of Illinois at Urbana-Champaign
 """
 
-import argparse
+import os
+import sys
 import torch
 import numpy as np
-
 from tqdm import tqdm
 from pprint import pprint
 import pickle
-import os
 
-import baseline.utils.mixture_consistency as mixture_consistency
-import baseline.models.improved_sudormrf as improved_sudormrf
-import baseline.metrics.dnnmos_metric as dnnmos_metric
-import baseline.dataset_loaders.chime as chime
+# Ensure local imports work
+sys.path.append(os.getcwd())
+
+from utils.config_loader import load_config
+from utils.mixture_consistency import apply as apply_mixture_consistency
+from models.improved_sudormrf import SuDORMRF
+from utils.emg_dataset import get_emg_dataloaders
+from losses.loss import negative_si_snr
 
 
-def get_args():
-    """! Command line parser"""
-    parser = argparse.ArgumentParser(description="Final evaluation Argument Parser")
-    parser.add_argument(
-        "--model_checkpoint",
-        type=str,
-        help="""The absolute path of a pre-trained separation model
-            that will be used for warm start for the teacher network.""",
-        default=None,
+def correct_sign(est, ref):
+    """
+    Flip the sign of `est` if it improves correlation with `ref`.
+    Inputs: (B, 1, L) or (B, L)
+    Returns: sign-corrected `est` with same shape.
+    """
+    if est.ndim == 3:
+        est = est.squeeze(1)  # (B, L)
+    if ref.ndim == 3:
+        ref = ref.squeeze(1)  # (B, L)
+
+    B, L = est.shape
+    est_np = est.cpu().numpy()
+    ref_np = ref.cpu().numpy()
+    corrected = np.zeros_like(est_np)
+
+    for b in range(B):
+        e = est_np[b]
+        r = ref_np[b]
+
+        # Avoid division by zero / constant signals
+        if np.std(e) < 1e-8 or np.std(r) < 1e-8:
+            corr = 0.0
+        else:
+            corr = np.corrcoef(e, r)[0, 1]
+
+        # Flip sign if correlation is negative
+        if corr < 0:
+            corrected[b] = -e
+        else:
+            corrected[b] = e
+
+    return torch.from_numpy(corrected).to(est.device).unsqueeze(1)  # (B, 1, L)
+
+
+def compute_pearson_corr(est, ref):
+    """
+    Compute Pearson correlation coefficient per batch sample.
+    Inputs: (B, 1, L) or (B, L)
+    Returns: numpy array of shape (B,)
+    """
+    if est.ndim == 3:
+        est = est.squeeze(1)
+    if ref.ndim == 3:
+        ref = ref.squeeze(1)
+    
+    est = est.cpu().numpy()
+    ref = ref.cpu().numpy()
+    corr = []
+    for e, r in zip(est, ref):
+        if np.std(e) < 1e-8 or np.std(r) < 1e-8:
+            corr.append(0.0)
+        else:
+            c = np.corrcoef(e, r)[0, 1]
+            corr.append(float(c) if not np.isnan(c) else 0.0)
+    return np.array(corr)
+
+
+def load_model(checkpoint_path, hparams):
+    model = SuDORMRF(
+        out_channels=hparams.get('out_channels', 256),
+        in_channels=hparams.get('in_channels', 512),
+        num_blocks=hparams.get('num_blocks', 8),
+        upsampling_depth=hparams.get('upsampling_depth', 7),
+        enc_kernel_size=hparams.get('enc_kernel_size', 81),
+        enc_num_basis=hparams.get('enc_num_basis', 512),
+        num_sources=2,  # [clean_emg, noise]
     )
-    parser.add_argument(
-        "--save_results_dir",
-        type=str,
-        help="""The absolute path for saving the full eval results file.""",
-        default=None,
-    )
-    parser.add_argument(
-        "--dataset_split",
-        type=str,
-        help="""The dataset split name for the CHiME data.""",
-        default='eval',
-        choices=['eval', 'dev']
-    )
-    parser.add_argument(
-        "--normalize_with_max_absolute_value",
-        action="store_true",
-        help="""Whether to normalize all audio files to [-1, 1] range.""",
-        default=False,
-    )
-    parser.add_argument(
-        "--evaluate_only_input_mixture",
-        action="store_true",
-        help="""Whether to use the input mixture instead of a .""",
-        default=False,
-    )
-    return parser.parse_args()
-
-
-def get_chime_generator(dataset_split):
-    data_loader = chime.Dataset(
-        sample_rate=16000, fixed_n_sources=1,
-        timelength=-1., augment=False, use_vad=False,
-        zero_pad=False, split=dataset_split, get_only_active_speakers=False,
-        normalize_audio=False, n_samples=-1)
-    return data_loader.get_generator(batch_size=1, num_workers=1)
-
-
-def load_sudo_rm_rf_model(path):
-    model = improved_sudormrf.SuDORMRF(
-        out_channels=256,
-        in_channels=512,
-        num_blocks=8,
-        upsampling_depth=7,
-        enc_kernel_size=81,
-        enc_num_basis=512,
-        num_sources=2,
-    )
-    # You can load the state_dict as here:
-    model.load_state_dict(torch.load(path))
-    print(f"Fetched model from: {path}")
+    state_dict = torch.load(checkpoint_path, map_location='cpu')
+    # Handle DataParallel checkpoints
+    if list(state_dict.keys())[0].startswith('module.'):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    print(f"Loaded model from: {checkpoint_path}")
     return model
 
 
-if __name__ == "__main__":
-    args = get_args()
-    hparams = vars(args)
-    test_generator = get_chime_generator(hparams['dataset_split'])
-    if not hparams["evaluate_only_input_mixture"]:
-        model = load_sudo_rm_rf_model(hparams['model_checkpoint'])
-        model = model.cuda()
-        model.eval()
-    else:
-        model = None
-    test_tqdm_gen = tqdm(enumerate(test_generator), desc='Eval on 16kHz chime 1 speaker')
-    res_dic = {
-            "sig_mos": [],
-            "bak_mos": [],
-            "ovr_mos": [],
+def apply_output_transform(estimates, mix_std, mix_mean, mixture, hparams):
+    if hparams.get("rescale_to_input_mixture", False):
+        estimates = (estimates * mix_std) + mix_mean
+    if hparams.get("apply_mixture_consistency", False):
+        estimates = apply_mixture_consistency(estimates, mixture)
+    return estimates
+
+
+def _agg(arr):
+    return {
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "std": float(np.std(arr))
     }
-    gen_len = len(test_generator)
+
+
+def main():
+    # Load hyperparameters from YAML
+    config_path = "config/eval.yaml"
+    hparams = load_config(config_path)
+
+    # Setup test dataloader
+    _, test_loader = get_emg_dataloaders(
+        train_dir=None,
+        val_dir=hparams["test_dir"],
+        batch_size=hparams.get("batch_size", 1),
+        num_workers=hparams.get("num_workers", 4)
+    )
+
+    # Load model
+    model = load_model(hparams["model_checkpoint"], hparams)
+    model = model.cuda()
+    model.eval()
+
+    all_sisdr_raw = []
+    all_sisdri_raw = []
+    all_corr_raw = []
+
+    all_sisdr_corrected = []
+    all_sisdri_corrected = []
+    all_corr_corrected = []
+
+    test_tqdm_gen = tqdm(enumerate(test_loader), desc="EMG Denoising Eval", total=len(test_loader))
+
     with torch.no_grad():
-        for j, mixture in test_tqdm_gen:
-            np_mixture_mean = mixture[0].cpu().numpy().mean(-1)
-            np_mixture_std = mixture[0].cpu().numpy().std(-1)
-            if hparams["evaluate_only_input_mixture"]:
-                s_est_speech = mixture[0].cpu().numpy()
-            else:
-                file_length = mixture.shape[-1]
-                min_k = int(np.ceil(np.log2(file_length/16000)))
-                padded_length = 2**max(min_k, 1) * 16000
+        for j, batch in test_tqdm_gen:
+            clean = batch["clean"].cuda()      # (B, L)
+            noise = batch["noise"].cuda()      # (B, L)
 
-                input_mix = torch.zeros((1, padded_length), dtype=mixture.dtype)
-                input_mix[..., :file_length] = mixture
+            gt_clean = clean.unsqueeze(1)      # (B, 1, L)
+            mixture = (clean + noise).unsqueeze(1)  # (B, 1, L)
 
-                input_mix = input_mix.unsqueeze(1).cuda()
-                input_mix_std = input_mix.std(-1, keepdim=True)
-                input_mix_mean = input_mix.mean(-1, keepdim=True)
-                input_mix = (input_mix - input_mix_mean) / (input_mix_std + 1e-9)
+            # Normalize mixture (same as training)
+            mix_std = mixture.std(dim=-1, keepdim=True)
+            mix_mean = mixture.mean(dim=-1, keepdim=True)
+            norm_mixture = (mixture - mix_mean) / (mix_std + 1e-9)
 
-                student_estimates = model(input_mix)
-                student_estimates = mixture_consistency.apply(student_estimates, input_mix)
+            # Forward pass
+            estimates = model(norm_mixture)    # (B, 2, L)
+            estimates = apply_output_transform(estimates, mix_std, mix_mean, mixture, hparams)
 
-                s_est_speech = student_estimates[0, 0, :file_length].detach().cpu().numpy()
+            est_clean_raw = estimates[:, 0:1]  # (B, 1, L)
 
-            if hparams["normalize_with_max_absolute_value"]:
-                s_est_speech -= s_est_speech.mean(-1)
-                s_est_speech /= np.abs(s_est_speech).max(-1) + 1e-9
-            else:
-                s_est_speech = (s_est_speech - s_est_speech.mean(-1)) / (s_est_speech.std(-1) + 1e-9)
-                s_est_speech = (s_est_speech * np_mixture_std) + np_mixture_mean
-            dnsmos_res_dic = dnnmos_metric.compute_dnsmos(s_est_speech, fs=16000)
-            for k, v in dnsmos_res_dic.items():
-                res_dic[k].append(v)
-            ovrl_mos_avg = round(np.mean(res_dic["ovr_mos"]), 2)
-            bak_mos_avg = round(np.mean(res_dic["bak_mos"]), 2)
-            sig_mos_avg = round(np.mean(res_dic["sig_mos"]), 2)
+            # --- Raw metrics ---
+            sisdr_raw = -negative_si_snr(est_clean_raw, gt_clean).cpu().numpy()
+            mix_sisdr = -negative_si_snr(mixture, gt_clean).cpu().numpy()
+            sisdri_raw = sisdr_raw - mix_sisdr
+            corr_raw = compute_pearson_corr(est_clean_raw, gt_clean)
+
+            all_sisdr_raw.extend(sisdr_raw.tolist())
+            all_sisdri_raw.extend(sisdri_raw.tolist())
+            all_corr_raw.extend(corr_raw.tolist())
+
+            # --- Sign-corrected metrics ---
+            est_clean_corrected = correct_sign(est_clean_raw, gt_clean)
+            sisdr_corrected = -negative_si_snr(est_clean_corrected, gt_clean).cpu().numpy()
+            sisdri_corrected = sisdr_corrected - mix_sisdr
+            corr_corrected = compute_pearson_corr(est_clean_corrected, gt_clean)
+
+            all_sisdr_corrected.extend(sisdr_corrected.tolist())
+            all_sisdri_corrected.extend(sisdri_corrected.tolist())
+            all_corr_corrected.extend(corr_corrected.tolist())
+
+            # Update progress bar
+            avg_sisdri = np.mean(all_sisdri_corrected)
             test_tqdm_gen.set_description(
-                f"Avg OVRL MOS: {ovrl_mos_avg}, BAK: {bak_mos_avg}, SIG: {sig_mos_avg} {j}/{gen_len}")
+                f"SI-SDRi (sign-corrected): {avg_sisdri:.2f} ({j+1}/{len(test_loader)})"
+            )
 
-    aggregate_results = {}
-    for k, values in res_dic.items():
-        mean_metric = np.mean(values)
-        median_metric = np.median(values)
-        std_metric = np.std(values)
-        aggregate_results[k] = {'mean': mean_metric, 'median': median_metric, 'std': std_metric}
+    # Aggregate results
+    aggregate_results = {
+        "raw": {
+            "sisdr": _agg(all_sisdr_raw),
+            "sisdri": _agg(all_sisdri_raw),
+            "pearson_corr": _agg(all_corr_raw)
+        },
+        "corrected": {
+            "sisdr": _agg(all_sisdr_corrected),
+            "sisdri": _agg(all_sisdri_corrected),
+            "pearson_corr": _agg(all_corr_corrected)
+        }
+    }
 
     pprint(aggregate_results)
-    if hparams["evaluate_only_input_mixture"]:
-        model_name = 'unprocessed'
-    else:
-        model_name = os.path.basename(hparams['model_checkpoint'])
-    if hparams['save_results_dir'] is None:
-        save_path = os.path.join('/tmp',
-                                 model_name + f'_full_eval_results_{hparams["dataset_split"]}.pkl')
-    else:
-        save_path = os.path.join(hparams['save_results_dir'],
-                                 model_name + f'_full_eval_results_{hparams["dataset_split"]}.pkl')
 
-    with open(save_path, 'wb') as handle:
-        pickle.dump(aggregate_results, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    # Save results
+    model_name = os.path.splitext(os.path.basename(hparams["model_checkpoint"]))[0]
+    save_dir = hparams.get("save_results_dir", "/tmp")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{model_name}_emg_eval_results.pkl")
+
+    with open(save_path, 'wb') as f:
+        pickle.dump(aggregate_results, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"\n✅ Evaluation complete. Results saved to:\n{save_path}")
+
+
+if __name__ == "__main__":
+    main()

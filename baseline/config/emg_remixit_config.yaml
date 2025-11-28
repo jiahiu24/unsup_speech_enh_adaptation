@@ -1,0 +1,37 @@
+project_name: "emg_remixit_v1"
+API_KEY: "8EQMeSc91IYhkD0YnxR1Nl3mT"
+
+# Model
+out_channels: 128
+in_channels: 512
+num_blocks: 16
+upsampling_depth: 4
+enc_kernel_size: 21
+enc_num_basis: 512
+
+# Training
+n_epochs: 50
+batch_size: 1
+learning_rate: 0.0003
+clip_grad_norm: 5.0
+patience: 10
+divide_lr_by: 3.0
+teacher_momentum: 0.99
+
+# Data
+unsup_train_dir: "/mnt/storage/siat_cjh/tmp/TrustEMG-main/self_noise_emg/emg_full_signal"
+fs: 2000
+num_workers: 4
+
+# Logging
+log_signals: True
+log_every_epoch: 1
+save_models_every: 10
+checkpoint_storage_path: "/mnt/storage/siat_cjh/proj/unsup_speech_enh_adaptation/baseline/checkpoints/student"
+
+# Warmup
+warmup_checkpoint: "/mnt/storage/siat_cjh/proj/unsup_speech_enh_adaptation/baseline/checkpoints/emg_enhancement_rescale/sup_teacher_epoch_100.pt"
+
+# Post-processing
+rescale_to_input_mixture: true
+apply_mixture_consistency: false

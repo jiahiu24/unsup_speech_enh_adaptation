@@ -1,0 +1,37 @@
+# configs/emg_config.yaml
+
+# 数据相关
+train_dir: "/mnt/storage/siat_cjh/tmp/TrustEMG-main/main/data_E1_S40_Ch2_withSTI_seg2000ms_MXIT/train/noisy"
+val_dir: "/mnt/storage/siat_cjh/tmp/TrustEMG-main/main/data_E1_S40_Ch2_withSTI_seg2000ms_MXIT/val/noisy"
+fs: 1000                  # ⚠️ 确认是否为 1000（典型 EMG 采样率）
+max_num_sources: 2
+
+# 模型结构
+out_channels: 128
+in_channels: 512
+num_blocks: 16
+upsampling_depth: 4
+enc_kernel_size: 21
+enc_num_basis: 512
+
+# 训练设置
+n_epochs: 50
+batch_size: 64
+learning_rate: 0.001
+clip_grad_norm: 5.0
+patience: 0               # 设为 >0 才启用 LR 衰减
+divide_lr_by: 2.0
+num_workers: 4            # 替代 n_jobs
+
+# 日志与保存
+project_name: "emg_enhancement"
+cometml_tags: ["emg", "sudormrf", "supervised"]
+experiment_name: "emg_sudormrf_v1"
+checkpoint_storage_path: "checkpoints"
+save_models_every: 10
+log_signals: true         # 控制是否记录波形（原 log_audio 未被使用）
+
+# 其他
+rescale_to_input_mixture: true
+apply_mixture_consistency: true
+API_KEY: "8EQMeSc91IYhkD0YnxR1Nl3mT"

@@ -1,0 +1,19 @@
+# config/eval.yaml
+model_checkpoint: "/mnt/storage/siat_cjh/proj/unsup_speech_enh_adaptation/baseline/checkpoints/emg_enhancement_rescale/sup_teacher_epoch_100.pt"
+test_dir: "/mnt/storage/siat_cjh/tmp/TrustEMG-main/main/data_E1_S40_Ch2_withSTI_seg2000ms_MXIT/val/noisy"
+save_results_dir: "results/emg_eval"
+
+batch_size: 32
+num_workers: 4
+
+# Model architecture (only needed if not saved in checkpoint metadata)
+out_channels: 128
+in_channels: 512
+num_blocks: 16
+upsampling_depth: 4
+enc_kernel_size: 21
+enc_num_basis: 512
+
+# Post-processing (MUST match training config!)
+rescale_to_input_mixture: true
+apply_mixture_consistency: false

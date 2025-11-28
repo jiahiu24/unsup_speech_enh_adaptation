@@ -118,7 +118,7 @@ class AudioLogger(object):
                     copy_to_tmp=True, step=step)
 
 
-def report_losses_mean_and_std(res_dic, experiment, tr_step, val_step):
+def report_losses_mean_and_std(res_dic, experiment, val_step):
     """Wrapper for cometml loss report functionality.
     Reports the mean and the std of each loss by inferring the train and the
     val string and it assigns it accordingly.
